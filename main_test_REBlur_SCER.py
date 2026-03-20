@@ -32,31 +32,45 @@ class DataLoaderTest_VoxelH5(Dataset):
     def __init__(self, h5_path):
         self.h5_path = h5_path
         with h5py.File(self.h5_path, 'r') as f:
-            # 获取所有图像的 key (image000000000, ...)
             self.keys = sorted(f['images'].keys())
-            # 记录总数
             self.num_frames = len(self.keys)
 
     def __len__(self):
         return self.num_frames
 
     def __getitem__(self, idx):
+        # 计算三帧的索引：过去(p), 当前(c), 未来(f)
+        idx_p = max(0, idx - 1)
+        idx_c = idx
+        idx_f = min(self.num_frames - 1, idx + 1)
+        
+        indices = [idx_p, idx_c, idx_f]
+        
+        blur_imgs = []
+        voxels = []
+        
         with h5py.File(self.h5_path, 'r') as f:
-            # 生成 key 名称
-            img_key = f"image{idx:09d}"
-            voxel_key = f"voxel{idx:09d}"
+            for i in indices:
+                img_key = f"image{i:09d}"
+                voxel_key = f"voxel{i:09d}"
+                
+                img = np.array(f['images'][img_key]).astype(np.float32)
+                voxel = np.array(f['voxels'][voxel_key]).astype(np.float32)
+                
+                if img.max() > 1.0: img /= 255.0
+                blur_imgs.append(img)
+                voxels.append(voxel)
             
-            # 读取数据
-            # 注意：根据你的 h5ls 输出，维度已经是 (3, 260, 320) 和 (6, 260, 320)
-            blur_img = np.array(f['images'][img_key]).astype(np.float32)
-            sharp_img = np.array(f['sharp_images'][img_key]).astype(np.float32)
-            voxel = np.array(f['voxels'][voxel_key]).astype(np.float32)
-
-            # 归一化检查 (如果 H5 里存的是 0-255，则除以 255)
-            if blur_img.max() > 1.0: blur_img /= 255.0
+            # 读取当前帧对应的 GT (用于指标计算)
+            gt_key = f"image{idx_c:09d}"
+            sharp_img = np.array(f['sharp_images'][gt_key]).astype(np.float32)
             if sharp_img.max() > 1.0: sharp_img /= 255.0
 
-        return torch.from_numpy(blur_img), torch.from_numpy(voxel), torch.from_numpy(sharp_img)
+        # 将列表转换为 numpy 数组，维度变为 (3, C, H, W)
+        blur_imgs = np.stack(blur_imgs, axis=0)
+        voxels = np.stack(voxels, axis=0)
+
+        return torch.from_numpy(blur_imgs), torch.from_numpy(voxels), torch.from_numpy(sharp_img)
 
 def main():
     # 结果保存路径
@@ -65,7 +79,7 @@ def main():
 
     # 【修改】强制指向 GoPro 权重
     model_dir = './checkpoints/models/STCNet' 
-    path_chk_rest = os.path.join(model_dir, 'model_best_psnr.pth')
+    path_chk_rest = os.path.join(model_dir, 'model_best.pth')
     
     ######### Model ###########
     # 根据你的 H5 维度，inChannels_event 设为 6
@@ -101,10 +115,13 @@ def main():
         psnr_seq = []
         ssim_seq = []
 
+        # main_test_REBlur_SCER.py 中的循环部分
         for ii, (img, voxel, gt) in enumerate(tqdm(test_loader)):
+            # 此时 img 维度为 (1, 3, 3, H, W), voxel 维度为 (1, 3, 6, H, W)
             img, voxel, gt = img.cuda(), voxel.cuda(), gt.cuda()
 
             with torch.no_grad():
+                # 模型内部会通过 img.shape 获取 frames=3 并进行循环处理
                 restored = model_restoration(img, voxel)
 
             # 后处理：转回 numpy 并对齐维度 (HWC)
